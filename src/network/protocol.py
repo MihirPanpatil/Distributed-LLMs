@@ -22,6 +22,7 @@ class MessageProtocol:
     def __init__(self, zmq_context=None):
         self.zmq_context = zmq_context or zmq.Context()
         self.zmq_socket = None
+        self.use_zmq = False  # Flag to track if ZMQ is being used
     
     def setup_zmq_socket(self, socket_type, address=None):
         """Setup a ZeroMQ socket for communication"""
@@ -34,7 +35,7 @@ class MessageProtocol:
         self.zmq_socket = socket
         return socket
     
-    def send_message(self, sock, command: str, payload: Optional[bytes] = None, 
+    def send_message(self, sock: socket.socket, command: str, payload: Optional[bytes] = None, 
                      metadata: Optional[Dict[str, Any]] = None) -> bool:
         """Send a message with the specified command and optional payload"""
         # Use ZeroMQ if available
@@ -66,6 +67,9 @@ class MessageProtocol:
                 
             return True
             
+        except socket.timeout:
+            print("Timeout while sending message")
+            return False
         except Exception as e:
             print(f"Error sending message: {e}")
             return False
@@ -77,18 +81,27 @@ class MessageProtocol:
             return self._receive_zmq_message(timeout)
             
         # Fallback to regular socket
-        sock.settimeout(timeout)
-        
         try:
+            sock.settimeout(timeout)
+            
             # Receive header length
-            header_len_bytes = sock.recv(HEADER_SIZE)
-            if not header_len_bytes:
-                return {}, None
+            header_len_bytes = b""
+            while len(header_len_bytes) < HEADER_SIZE:
+                chunk = sock.recv(HEADER_SIZE - len(header_len_bytes))
+                if not chunk:
+                    return {}, None
+                header_len_bytes += chunk
                 
             header_len = int(header_len_bytes.decode().strip())
             
             # Receive header
-            header_bytes = sock.recv(header_len)
+            header_bytes = b""
+            while len(header_bytes) < header_len:
+                chunk = sock.recv(header_len - len(header_bytes))
+                if not chunk:
+                    raise ConnectionError("Connection closed while receiving header")
+                header_bytes += chunk
+            
             header = pickle.loads(header_bytes)
             
             # Receive payload if exists
@@ -117,17 +130,21 @@ class MessageProtocol:
             
     def _send_zmq_message(self, command: str, payload: Optional[bytes] = None,
                         metadata: Optional[Dict[str, Any]] = None) -> bool:
-        """Send message using ZeroMQ socket"""
+        """Send message using ZeroMQ socket with identity frame"""
         try:
             header = {"command": command}
             if metadata:
                 header.update(metadata)
-                
+            
             if payload is not None:
                 header["payload_size"] = len(payload)
-                
-            # Send header and payload as multipart message
+            
+            # Get identity from metadata if present
+            identity = metadata.get('identity', b'')
+            
+            # Send as multipart message with identity
             self.zmq_socket.send_multipart([
+                identity,
                 pickle.dumps(header),
                 payload if payload is not None else b""
             ])
@@ -137,22 +154,20 @@ class MessageProtocol:
             print(f"Error sending ZMQ message: {e}")
             return False
             
-    def _receive_zmq_message(self, timeout: int = 60) -> Tuple[Dict[str, Any], Optional[bytes]]:
-        """Receive message using ZeroMQ socket"""
+    def _receive_zmq_message(self, timeout: int = 60) -> Tuple[bytes, Dict[str, Any], Optional[bytes]]:
+        """Receive message using ZeroMQ socket with identity frame"""
         try:
-            # Set timeout
             self.zmq_socket.setsockopt(zmq.RCVTIMEO, timeout * 1000)
-            
-            # Receive multipart message
             parts = self.zmq_socket.recv_multipart()
             
-            if len(parts) == 0:
-                return {}, None
+            if len(parts) < 2:
+                return b'', {}, None
                 
-            header = pickle.loads(parts[0])
-            payload = parts[1] if len(parts) > 1 else None
+            identity = parts[0]
+            header = pickle.loads(parts[1])
+            payload = parts[2] if len(parts) > 2 else None
             
-            return header, payload
+            return identity, header, payload
             
         except zmq.Again:
             raise TimeoutError("Timeout while receiving ZMQ message")

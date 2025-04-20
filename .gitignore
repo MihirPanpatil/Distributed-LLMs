@@ -129,3 +129,14 @@ Thumbs.db
 # Docker
 *.swp
 *.swo
+
+# Model files
+models/
+*.pth
+*.pt
+*.bin
+*.h5
+
+# Temporary files
+*.tmp
+*.temp

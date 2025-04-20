@@ -3,10 +3,12 @@ import socket
 import threading
 import time
 import json
+import os
+import zmq
 from typing import Dict, List, Any, Optional
 from queue import Queue
 
-from ..network.protocol import MessageProtocol
+from src.network.protocol import MessageProtocol
 from ..model.shard_manager import ModelShardManager
 
 class MasterNode:
@@ -22,13 +24,13 @@ class MasterNode:
         self.server_socket = None
         self.task_queue = Queue()
         self.result_queue = Queue()
+        self.zmq_context = zmq.Context()
         
     def start(self):
         """Start the master server"""
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_socket.bind((self.host, self.port))
-        self.server_socket.listen(5)
+        # Setup ZMQ socket
+        protocol = MessageProtocol(zmq_context=self.zmq_context)
+        self.server_socket = protocol.setup_zmq_socket(zmq.ROUTER, f"tcp://{self.host}:{self.port}")
         
         self.running = True
         print(f"Master node listening on {self.host}:{self.port}")
@@ -49,10 +51,34 @@ class MasterNode:
         if self.server_socket:
             self.server_socket.close()
             
-    def initialize_model(self, model_path: str, num_shards: int):
-        """Initialize and shard a model"""
-        self.model_path = model_path
-        self.shard_manager = ModelShardManager(model_path, num_shards)
+    def initialize_model(self, model_id: str, num_shards: int, cache_dir: str = "./models"):
+        """Download, initialize and shard a model
+        
+        Args:
+            model_id: HuggingFace model ID or local path
+            num_shards: Number of shards to split the model into
+            cache_dir: Directory to store downloaded models
+            
+        Returns:
+            Path to the directory containing model shards
+        """
+        from ..model.downloader import download_model
+        from ..model.loader import load_model
+        
+        # Download model if it's a HuggingFace model ID
+        if not os.path.exists(model_id):
+            print(f"Downloading model {model_id}...")
+            self.model_path = download_model(model_id, cache_dir=cache_dir)
+        else:
+            self.model_path = model_id
+            
+        # Load the model and tokenizer
+        print(f"Loading model from {self.model_path}...")
+        model, self.tokenizer = load_model(self.model_path)
+        
+        # Initialize shard manager and shard the model
+        print(f"Sharding model into {num_shards} parts...")
+        self.shard_manager = ModelShardManager(self.model_path, num_shards)
         return self.shard_manager.shard_model()
     
     def assign_shards(self):
@@ -115,13 +141,16 @@ class MasterNode:
         """Thread for accepting worker connections"""
         while self.running:
             try:
-                client_socket, address = self.server_socket.accept()
-                client_thread = threading.Thread(
+                # ZMQ message reception
+                # ZMQ message handling
+                # ZMQ message reception
+                msg_parts = self.server_socket.recv_multipart()
+                identity = msg_parts[0]
+                threading.Thread(
                     target=self._handle_worker,
-                    args=(client_socket, address)
-                )
-                client_thread.daemon = True
-                client_thread.start()
+                    args=(identity, msg_parts[1:]),
+                    daemon=True
+                ).start()
             except Exception as e:
                 if self.running:
                     print(f"Error accepting connection: {e}")
@@ -202,10 +231,28 @@ class MasterNode:
                 # Get a task
                 task_id, input_text = self.task_queue.get(block=True, timeout=1)
                 
-                # TODO: Tokenize input
-                input_data = input_text.encode('utf-8')
+                # Tokenize input if tokenizer is available
+                if self.tokenizer:
+                    try:
+                        input_data = self.tokenizer(input_text, return_tensors="pt")
+                        input_data = {k: v.to('cpu').numpy().tobytes() for k, v in input_data.items()}
+                        input_data = json.dumps(input_data).encode('utf-8')
+                    except Exception as e:
+                        print(f"Error tokenizing input: {e}")
+                        continue
+                else:
+                    # Fallback if tokenizer not available
+                    input_data = input_text.encode('utf-8')
                 
                 # Distribute to all workers
+                if not self.workers:
+                    print(f"No workers connected to process task {task_id}")
+                    continue
+                    
+                if not self.shard_assignments:
+                    print(f"No shard assignments available for task {task_id}")
+                    continue
+                    
                 for worker_id, worker in self.workers.items():
                     shard_ids = self.shard_assignments.get(worker_id, [])
                     if not shard_ids:
@@ -226,3 +273,5 @@ class MasterNode:
                 pass
             except Exception as e:
                 print(f"Error processing tasks: {e}")
+                # Sleep briefly to prevent tight error loops
+                time.sleep(0.5)

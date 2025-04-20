@@ -5,6 +5,7 @@ import time
 import torch
 import pickle
 import os
+import zmq
 from typing import Dict, List, Any, Optional
 
 from ..network.protocol import MessageProtocol
@@ -39,13 +40,30 @@ class WorkerNode:
         self.running = False
         self.server_socket = None
         self.master_socket = None
+        self.zmq_context = zmq.Context()
         
     def start(self):
         """Start the worker"""
         # Start server for master to connect
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_socket.bind((self.host, self.port))
+        
+        # Try binding to port with retries
+        bound = False
+        for i in range(5):
+            try:
+                self.server_socket.bind((self.host, self.port))
+                bound = True
+                break
+            except OSError as e:
+                if "Address already in use" in str(e):
+                    self.port += 1  # Try next port
+                    continue
+                raise
+                
+        if not bound:
+            raise RuntimeError(f"Could not bind to any port in range {self.port}-{self.port+4}")
+            
         self.server_socket.listen(5)
         
         self.running = True
@@ -86,8 +104,9 @@ class WorkerNode:
             host, port = self.master_address.split(':')
             port = int(port)
             
-            self.master_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.master_socket.connect((host, port))
+            # Create ZMQ connection to master
+            protocol = MessageProtocol(zmq_context=self.zmq_context)
+            self.master_socket = protocol.setup_zmq_socket(zmq.REQ, f"tcp://{host}:{port}")
             
             # Register with master
             capabilities = {
@@ -95,10 +114,9 @@ class WorkerNode:
                 "device": "cuda" if torch.cuda.is_available() else "cpu",
                 "memory": torch.cuda.get_device_properties(0).total_memory if torch.cuda.is_available() else 0
             }
-            
-            MessageProtocol.send_message(
-                self.master_socket,
-                "REGISTER",
+            MessageProtocol(self.zmq_context).send_message(
+                sock=self.master_socket,
+                command="REGISTER",
                 metadata={"capabilities": capabilities}
             )
             
@@ -107,8 +125,15 @@ class WorkerNode:
             master_thread.daemon = True
             master_thread.start()
             
+            print(f"Successfully connected to master at {self.master_address}")
+            
         except Exception as e:
             print(f"Error connecting to master: {e}")
+            # Retry connection after a delay
+            if self.running:
+                print(f"Retrying connection in 5 seconds...")
+                time.sleep(5)
+                self._connect_to_master()
     
     def _accept_connections(self):
         """Accept incoming connections"""
@@ -131,7 +156,8 @@ class WorkerNode:
         
         try:
             while self.running:
-                header, payload = MessageProtocol.receive_message(client_socket)
+                protocol = MessageProtocol(zmq_context=self.zmq_context)
+                header, payload = protocol.receive_message(client_socket)
                 if not header:
                     break
                     
@@ -147,7 +173,8 @@ class WorkerNode:
         """Handle messages from master"""
         try:
             while self.running:
-                header, payload = MessageProtocol.receive_message(self.master_socket)
+                protocol = MessageProtocol(zmq_context=self.zmq_context)
+                header, payload = protocol.receive_message(self.master_socket)
                 if not header:
                     break
                     
@@ -169,9 +196,9 @@ class WorkerNode:
             self.shards[shard_id].to_device()
             
             # Send confirmation
-            MessageProtocol.send_message(
-                socket,
-                "SHARD_LOADED",
+            MessageProtocol(self.zmq_context).send_message(
+                sock=socket,
+                command="SHARD_LOADED",
                 metadata={"shard_id": shard_id}
             )
             
@@ -182,9 +209,9 @@ class WorkerNode:
                 del self.shards[shard_id]
                 
             # Send confirmation
-            MessageProtocol.send_message(
-                socket,
-                "SHARD_UNLOADED",
+            MessageProtocol(self.zmq_context).send_message(
+                sock=socket,
+                command="SHARD_UNLOADED",
                 metadata={"shard_id": shard_id}
             )
             
@@ -203,9 +230,9 @@ class WorkerNode:
                     results.update(self.shards[shard_id].compute(inputs))
             
             # Send results back
-            MessageProtocol.send_message(
-                socket,
-                "RESULT",
+            MessageProtocol(self.zmq_context).send_message(
+                sock=socket,
+                command="RESULT",
                 payload=pickle.dumps(results),
                 metadata={"task_id": task_id}
             )
@@ -226,9 +253,9 @@ class WorkerNode:
                     results.update(self.shards[shard_id].compute(inputs))
             
             # Send results back
-            MessageProtocol.send_message(
-                socket,
-                "RESULT",
+            MessageProtocol(self.zmq_context).send_message(
+                sock=socket,
+                command="RESULT",
                 payload=pickle.dumps(results),
                 metadata={"task_id": task_id}
             )
@@ -238,9 +265,9 @@ class WorkerNode:
         while self.running:
             try:
                 if self.master_socket:
-                    MessageProtocol.send_message(
-                        self.master_socket,
-                        "HEARTBEAT",
+                    MessageProtocol(self.zmq_context).send_message(
+                        sock=self.master_socket,
+                        command="HEARTBEAT",
                         metadata={"timestamp": time.time()}
                     )
                 time.sleep(5)
